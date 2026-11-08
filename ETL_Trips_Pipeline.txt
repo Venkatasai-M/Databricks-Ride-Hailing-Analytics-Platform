@@ -1,0 +1,158 @@
+-- ====================================================================
+-- BRONZE LAYER: Raw Data Ingestion (Streaming Table)
+-- ====================================================================
+CREATE OR REFRESH STREAMING TABLE bronze_ride_trips
+COMMENT 'Raw ingested cab trip events with file metadata tracking'
+AS
+SELECT 
+    *,
+    _metadata.file_name AS source_file,
+    current_timestamp() AS loaded_at
+FROM STREAM read_files(
+    '/Volumes/mobility_catalog/trips/raw_files/',
+    format => 'csv',
+    header => true
+);
+
+-- ====================================================================
+-- SILVER LAYER: Cleaned & Sanitized Data
+-- ====================================================================
+CREATE OR REFRESH MATERIALIZED VIEW silver_trips_clean (
+    CONSTRAINT valid_distance EXPECT (distance_km > 0) ON VIOLATION DROP ROW,
+    CONSTRAINT valid_rate EXPECT (rate_per_km >= 0) ON VIOLATION DROP ROW
+)
+COMMENT 'Sanitized, deduplicated, and validated trips data'
+AS
+SELECT DISTINCT
+    trip_id,
+    customer_id,
+    driver_id,
+    CAST(trip_date AS DATE) AS trip_date,
+    CAST(pickup_hour AS INT) AS pickup_hour,
+    COALESCE(INITCAP(TRIM(city)), 'Unknown') AS city,
+    INITCAP(TRIM(pickup_zone)) AS pickup_zone,
+    INITCAP(TRIM(region)) AS region,
+    INITCAP(TRIM(vehicle_type)) AS vehicle_type,
+    INITCAP(TRIM(booking_channel)) AS booking_channel,
+    CAST(distance_km AS DOUBLE) AS distance_km,
+    CAST(duration_min AS INT) AS duration_min,
+    CAST(rate_per_km AS DOUBLE) AS rate_per_km,
+    CAST(COALESCE(fare_amount, distance_km * rate_per_km) AS DOUBLE) AS fare_amount,
+    CAST(COALESCE(discount_amount, 0.0) AS DOUBLE) AS discount_amount,
+    COALESCE(payment_method, 'Unknown') AS payment_method, -- NOTE: Do NOT use INITCAP to keep UPI intact
+    INITCAP(TRIM(payment_status)) AS payment_status,
+    CAST(driver_payout AS DOUBLE) AS driver_payout,
+    CAST(customer_rating AS DOUBLE) AS customer_rating,
+    INITCAP(TRIM(trip_type)) AS trip_type,
+    -- Business Metrics
+    CAST((COALESCE(fare_amount, distance_km * rate_per_km) - COALESCE(discount_amount, 0.0)) AS DOUBLE) AS net_revenue,
+    CAST(((COALESCE(fare_amount, distance_km * rate_per_km) - COALESCE(discount_amount, 0.0)) - driver_payout) AS DOUBLE) AS platform_earnings
+FROM bronze_ride_trips;
+
+-- ====================================================================
+-- SILVER LAYER: Rejected / Quarantined Data
+-- ====================================================================
+CREATE OR REFRESH MATERIALIZED VIEW silver_trips_rejected
+COMMENT 'Quarantined bad records violating business rules'
+AS
+SELECT 
+    trip_id,
+    customer_id,
+    driver_id,
+    trip_date,
+    city,
+    vehicle_type,
+    distance_km,
+    rate_per_km,
+    fare_amount,
+    payment_method,
+    CASE 
+        WHEN distance_km <= 0 THEN 'Distance is zero or negative'
+        WHEN rate_per_km < 0 THEN 'Rate per km is negative'
+        ELSE 'Other invalid parameter'
+    END AS reject_reason,
+    source_file,
+    loaded_at
+FROM bronze_ride_trips
+WHERE distance_km <= 0 OR rate_per_km < 0;
+
+-- ====================================================================
+-- GOLD LAYER: Business Analytics Materialized Views
+-- ====================================================================
+
+-- 1. Monthly Trends (BR-01)
+CREATE OR REFRESH MATERIALIZED VIEW gold_monthly_trips
+COMMENT 'Monthly aggregate trips, distance, net revenue, payout, and earnings'
+AS
+SELECT 
+    DATE_TRUNC('MONTH', trip_date) AS trip_month,
+    COUNT(*) AS trips,
+    ROUND(SUM(distance_km), 2) AS total_km,
+    ROUND(SUM(net_revenue), 2) AS net_revenue,
+    ROUND(SUM(driver_payout), 2) AS driver_payout,
+    ROUND(SUM(platform_earnings), 2) AS platform_earnings
+FROM silver_trips_clean
+GROUP BY DATE_TRUNC('MONTH', trip_date);
+
+-- 2. City Performance (BR-02)
+CREATE OR REFRESH MATERIALIZED VIEW gold_city_summary
+COMMENT 'Geographic trip volumes, revenue, and average fares'
+AS
+SELECT 
+    region,
+    city,
+    COUNT(*) AS trips,
+    ROUND(SUM(net_revenue), 2) AS net_revenue,
+    ROUND(AVG(net_revenue), 2) AS avg_fare_per_trip
+FROM silver_trips_clean
+GROUP BY region, city;
+
+-- 3. Vehicle Performance (BR-03)
+CREATE OR REFRESH MATERIALIZED VIEW gold_vehicle_summary
+COMMENT 'Fleet category analysis: trips, km, revenue, and customer ratings'
+AS
+SELECT 
+    vehicle_type,
+    COUNT(*) AS trips,
+    ROUND(SUM(distance_km), 2) AS total_km,
+    ROUND(SUM(net_revenue), 2) AS net_revenue,
+    ROUND(AVG(customer_rating), 2) AS avg_rating
+FROM silver_trips_clean
+GROUP BY vehicle_type;
+
+-- 4. Payment Analysis (BR-04)
+CREATE OR REFRESH MATERIALIZED VIEW gold_payment_summary
+COMMENT 'Payment breakdown and pending collection risks'
+AS
+SELECT 
+    payment_method,
+    COUNT(*) AS trips,
+    ROUND(SUM(net_revenue), 2) AS net_revenue,
+    ROUND(SUM(CASE WHEN payment_status = 'Pending' THEN net_revenue ELSE 0.0 END), 2) AS pending_amount
+FROM silver_trips_clean
+GROUP BY payment_method;
+
+-- 5. Data Quality Audit & Row Reconciliation (BR-05 & BR-06)
+CREATE OR REFRESH MATERIALIZED VIEW gold_data_quality
+COMMENT 'Audit reconciliation proof and data anomalies tracking'
+AS
+SELECT
+    (SELECT COUNT(*) FROM bronze_ride_trips) AS bronze_rows,
+    (SELECT COUNT(*) FROM silver_trips_clean) AS clean_rows,
+    (SELECT COUNT(*) FROM silver_trips_rejected) AS rejected_rows,
+    ((SELECT COUNT(*) FROM bronze_ride_trips) - (SELECT COUNT(DISTINCT trip_id) FROM bronze_ride_trips)) AS duplicate_rows,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM bronze_ride_trips) = 
+             ((SELECT COUNT(*) FROM silver_trips_clean) + 
+              (SELECT COUNT(*) FROM silver_trips_rejected) + 
+              ((SELECT COUNT(*) FROM bronze_ride_trips) - (SELECT COUNT(DISTINCT trip_id) FROM bronze_ride_trips)))
+        THEN 'PASSED' 
+        ELSE 'FAILED' 
+    END AS reconciliation_status,
+    -- Anomaly metrics in raw data
+    (SELECT COUNT(*) FROM bronze_ride_trips WHERE city IS NULL) AS missing_city_rows,
+    (SELECT COUNT(*) FROM bronze_ride_trips WHERE fare_amount IS NULL) AS missing_fare_rows,
+    (SELECT COUNT(*) FROM bronze_ride_trips WHERE payment_method IS NULL) AS missing_payment_rows,
+    (SELECT COUNT(*) FROM bronze_ride_trips WHERE customer_rating IS NULL) AS missing_rating_rows,
+    (SELECT COUNT(*) FROM bronze_ride_trips WHERE distance_km <= 0) AS invalid_distance_rows,
+    (SELECT COUNT(*) FROM bronze_ride_trips WHERE rate_per_km < 0) AS invalid_rate_rows;
